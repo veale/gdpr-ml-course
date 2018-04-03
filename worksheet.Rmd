@@ -1,0 +1,240 @@
+---
+title: "GDPR-Ready Machine Learning Tutorial"
+author: "Michael Veale"
+date: "PAPIS Europe | 04/04/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Dataset
+
+We'll look at three main datasets in the lab, all of them available from the UCI Machine Learning repository.
+
+- the `Adult` Dataset: an extract of U.S. census data. The prediction task is to predict which individuals earn more than $50K USD, and which less. This is a relevant task in our context, as it says something about sociodemographics and spending habits, which may be important online. That said, it is also a simple task: most data from online profiling is considerably more extensive, and messier, than this quite well sorted census data. https://archive.ics.uci.edu/ml/datasets/adult
+
+- the `Sentiment Labelled Sentences` dataset, where we will consider Yelp and Amazon reviews coded for positivity https://archive.ics.uci.edu/ml/datasets/Sentiment+Labelled+Sentences  
+- the `SMS Spam` dataset, with 5574 messages coded as 'spam' or 'ham'. https://archive.ics.uci.edu/ml/datasets/sms+spam+collection
+
+To begin with, we'll need to ensure some packages are installed which we will need for the following exercises. I'm going to avoid having us train models in the tutorial, as this can take time. Instead, you'll have to trust me with the models I provide that they are sanely trained.
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse) # install.packages("tidyverse")
+library(caret) # install.packages("caret")
+library(e1071) # install.packages("e1071") # for neural networks
+library(lime) # install.packages("lime")
+library(xgboost) # install.packages("xgboost") # For gradient boosting
+library(text2vec) # install.packages("text2vec") # For document term matrix transformation and tokenisation
+```
+
+### Transparency
+
+#### Interpretable by default?
+
+Some model types are commonly thought to more interpretable than others. There is some truth in this. A linear regression is more interpretable by virtue of the fact that the local model and the global model are of a similar order of complexity. Yet in practice, it can be very difficult to interpret: a GLM with a difficult to parse link function; many (hundreds, thousands) of abstract variables: these factors make even linear models difficult to understand in conventjonal terms.
+
+Low dimensional data often benefits from a model less-straightforward than a linear regression or a decision tree. Consequently, these models will often not be those immediately turned to in situations where the variables are most amenable to human understanding. Where they excel --- and still are high on international benchmarks --- is precisely in extremely high dimensional situations, like text analysis.
+
+#### Variable importance
+
+Methods to establish the importance of different variables in an ML system exist for many different model types. Many were developed for the purpose of feature selection or feature engineering. The `?varImp` command will open up the documentation for the Variable Importance function in `caret`. This is a great compilation (and often implementation) of variable importance methods for many different methods, ranging from linear models to tree-based models to neural networks.
+
+
+##### Problems with variable importance
+- Variable importance scores do not give an indication of directionality. This is problematic, as you might know that a certain variable is important, but not know whether it contributes to or against a particular predicted outcome. 
+- Variable importance scores will likely fail when there are highly non-linear models. In particular, they will fail to be relevant to those whom the decision relates to, as while the variables might be globally important, they might be locally irrelevant.
+- Can be biased in varied ways: towards highly correlated variables, also statistically have bizarre properties when different types and scales of variables are used.[^varimp]
+
+Nevertheless, variable importance is a useful and often available starting point in your toolkit to understand which variables might be pivotal in many decisions. 
+
+In `caret`, it is usually as simple as running `varImp()` over a trained model. Other packages might have different means of implementing variable importance where they do.
+
+Variable importance can, for certain types of models, be used for *subject-centric explanations*. `xgboostExplainer` is an example of this.
+
+
+#### Local, model agnostic explanations using LIME
+
+##### Classic tabular data and classification
+
+First, we can try to explain the results of a normal classification system.
+
+We're going to use the `adult` dataset from the UCI ML repository. For classification purposes, it's useful to clean it a bit. I've already written some code to download it and clean it, so let's just use that as a shortcut. Feel free to examine the code to see what cleaning has occurred.
+
+```{r}
+source("https://raw.githubusercontent.com/veale/gdpr-ml-course/master/adult_data_import.R")
+adult_data <- dataprep() %>% as_tibble
+```
+
+Now to build the training and test sets
+
+```{r, cache = TRUE}
+stor <- list()
+set.seed(100)
+
+# Partition train and test sets
+stor$partition <- createDataPartition(adult_data$income, times = 1, p = 0.3, list = F)
+stor$train <- adult_data[-stor$partition,]
+stor$test <- adult_data[stor$partition,]
+
+# Train one hidden layer neural network
+stor$grid <- expand.grid(.decay = 0.5, .size = 5) # Pre-set for time in the lab, usually would search parameter space
+stor$control <- trainControl(method="repeatedcv", number=3, repeats=3)
+stor$nnet.fit <- train(income ~ ., data = stor$train, method = "nnet", maxit = 1000, tuneGrid = stor$grid, trace = FALSE, linout = FALSE, MaxNWts = 2040, trControl = stor$control)
+```
+
+Does this model work?
+
+```{r}
+# Test performance of models
+confusionMatrix(predict(stor$nnet.fit, stor$test), stor$test$income)
+```
+
+Building the explainer: 7 is an illustrative sentence number.
+
+```{r}
+explainer <- lime(stor$train, stor$nnet.fit)
+testcase <- 7
+explanation <- lime::explain(stor$test[testcase,-13], explainer, labels = predict(stor$nnet.fit, stor$test[testcase,]), n_features = 12)
+plot_features(explanation)
+```
+
+
+1. Get the code running on your own machine, and try to understand the different steps involved.
+2. How do the explanations you generate with this approach differ from those you might expect given the variable importance scores (run the `varImp()` function on the model object)
+3. How might you evaluate these explanations for usability and for the help they provide an individual in understanding their prediction? Try to look at cases of misclassification, or cases of minority groups. To explore the dataset, you might want to use the tool from Google available here, which has a version of the Adult dataset preloaded https://pair-code.github.io/facets/ 
+
+##### Text classification
+
+In this section, we're going to see how LIME can help highlight the words that are important for a particular text classification.
+
+```{r, message = FALSE, warning = FALSE}
+library(lime) # For explanations
+
+library(tidyverse)
+```
+The data we'll use initially is from *'From Group to Individual Labels using Deep Features', Kotzias et. al,. KDD 2015*. It's available on the UCI Repository.
+
+```{r}
+txt <- list() # Make container for project
+txt$import <- list() # Setup for data
+txt$col_names <- c("sentence", "sentiment") # Column names
+
+## Import data ##  
+txt$import$yelp <- read_tsv("yelp_labelled.txt", col_names = txt$col_names) # Import Yelp data
+txt$import$amazon <- read_tsv("amazon_cells_labelled.txt", col_names = txt$col_names) # Import Amazon data
+txt$all <- bind_rows(txt$import) # Bind Amazon and Yelp data 
+
+## Let's see the data ##
+print(txt$all)
+```
+
+```{r}
+set.seed(100) # Reproducibility
+
+# Make train set partition
+txt$partition <- createDataPartition(txt$all$sentiment, p = 0.3, list = FALSE) 
+txt$test <- txt$all[txt$partition,] # Partition test set
+txt$train <- txt$all[-txt$partition,] # Partition training set
+
+# Make function to tokenize test consistently
+txt$get_matrix <- function(text) {
+  it <- itoken(text, progressbar = FALSE)
+  create_dtm(it, vectorizer = hash_vectorizer())
+}
+
+# Turn train and test sentences into Document-Term Matrices
+txt$train.dtm = txt$get_matrix(txt$train$sentence)
+txt$test.dtm = txt$get_matrix(txt$test$sentence)
+
+```
+
+
+```{r, cache = TRUE}
+## Train a simple ML model to predict sentiment ##
+# Set parameters
+txt$param <- list(max_depth = 7, 
+              eta = 0.1, 
+              objective = "binary:logistic", 
+              eval_metric = "auc", 
+              nthread = 1)
+
+# Train xgboost model
+txt$xgb_model <- xgb.train(
+  txt$param, 
+  xgb.DMatrix(txt$train.dtm, label = txt$train$sentiment),
+  nrounds = 300,
+)
+
+# Does it perform okay? Let's look at the test set
+confusionMatrix(factor(round(predict(txt$xgb_model, txt$test.dtm))), factor(txt$test$sentiment))
+
+```
+
+Now we need to build the explanation system. We have a few different options for this.
+
+Firstly, we can build static explanations
+
+```{r}
+# Take a particular sentence 
+txt$explained_sentence <- txt$test$sentence[480]
+```
+
+```{r}
+
+txt$explainer <- lime(x = txt$train$sentence, # The training data: used to perturb
+                      model = txt$xgb_model, # The model to explain
+                      preprocess = txt$get_matrix # To preprocess the training data
+                      )
+
+
+txt$explanation <- explain(txt$explained_sentence, # What to explain?
+                           txt$explainer, # The explainer object made above
+                           n_labels = 1, # How many labels are there at a time?
+                           n_features = 3) # How many words to explain 
+txt$explanation
+```
+
+These can be plotted to see how they look (0 is the label for bad sentiment, 1 is the label for good. The green is, somewhat confusingly, how much they contribute towards the given label, not how much they are positive or negative.)
+
+```{r}
+plot_text_explanations(txt$explanation)
+```
+` `
+
+` `
+
+` `
+
+
+The other thing that can be done is to interactively explore text explanations by providing your own input data. This can be done (`shiny` package needs to be installed) using the `interactive_text_explanations(txt$explainer)` command.
+
+
+To do:
+
+1. Get the code working on your machine for the model above. How might you present the explanations best? Can you use explanations to work out why the model misclassifies certain sentences?
+
+2. Try building a simple model and establishing explanations for the SMS Spam dataset.
+
+
+```{r}
+temp <- tempfile()
+download.file("https://archive.ics.uci.edu/ml/machine-learning-databases/00228/smsspamcollection.zip",temp)
+spam <- list()
+spam$raw <- read_lines(unz(temp, filename = "SMSSpamCollection"))
+spam$df <- data_frame(message = gsub("spam\t", "", gsub("ham\t", "", spam$raw)),
+           label = ifelse(grepl("^spam", spam$raw), "Spam", "Ham"))
+```
+
+
+#### Further resources
+SLIM is a machine learning method to learn scoring systems - binary classification models that let users make quick predictions by adding, subtracting and multiplying a few small numbers. The core idea of SLIM is to create scorecards which are also optimised for accuracy and sparsity. Such cards can be easily and interpretably deployed in organisational environments, such as risk scoring. https://github.com/ustunb/slim-python
+
+
+The Layer-wise Relevance Propagation (LRP) algorithm explains a classifer's prediction specific to a given data point by attributing relevance scores to important components of the input by using the topology of the learned model itself. https://github.com/sebastian-lapuschkin/lrp_toolbox
+
+
+
+[^varimp]: Strobl et al. (2007) https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1796903/; Strobl et al. (2008) https://bigdata.unl.edu/documents/ASA_Workshop_Materials/Why%20and%20how%20to%20use%20random%20forest%20variable%20importance%20measures.pdf
+
