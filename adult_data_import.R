@@ -134,3 +134,5 @@ dataprep <- function(){
   
   return(data) 
 }
+
+adult_data <- dataprep()
